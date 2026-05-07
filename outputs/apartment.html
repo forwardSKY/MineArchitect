@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PGA Sketch</title>
+<style>
+*{margin:0;box-sizing:border-box}
+body{background:#f5f2ed;overflow:hidden;font-family:system-ui,sans-serif}
+canvas{display:block;cursor:grab}canvas:active{cursor:grabbing}
+#hud{position:fixed;top:16px;left:16px;background:rgba(245,242,237,.92);border:1px solid rgba(0,0,0,.08);border-radius:8px;padding:12px 16px;pointer-events:auto;max-width:260px}
+#hud h3{font-size:12px;font-weight:600;color:#2a2a2a;letter-spacing:.5px;text-transform:uppercase;margin-bottom:4px}
+#hud p{font-size:11px;color:#888;line-height:1.5;margin:0}
+#info{position:fixed;bottom:16px;left:16px;font-size:10px;color:#aaa}
+#cut{position:fixed;right:16px;top:50%;transform:translateY(-50%);writing-mode:vertical-lr;-webkit-appearance:none;width:3px;height:180px;background:rgba(0,0,0,.1);border-radius:2px;outline:none}
+#cut::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;background:#2a2a2a;cursor:grab}
+.btn{font-size:11px;padding:4px 10px;border:1px solid rgba(0,0,0,.12);border-radius:4px;background:#fff;cursor:pointer;color:#444;margin:2px}
+.btn:hover{background:#eee}.btn.on{background:#2a2a2a;color:#fff;border-color:#2a2a2a}
+</style></head><body>
+<div id="hud">
+<h3>PGA Sketch Engine</h3>
+<p>20 entities · all DOF=0</p>
+<div style="margin-top:6px">
+<button class="btn on" onclick="setMode('sketch')">Sketch</button>
+<button class="btn" onclick="setMode('xray')">X-Ray</button>
+<button class="btn" onclick="setMode('wire')">Wire</button>
+</div>
+</div>
+<input type="range" id="cut" min="0" max="100" value="100" oninput="setCut(this.value)">
+<div id="info">Drag to orbit · Scroll to zoom · Slider to section</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const M=[{"id":"entrance","type":"corridor","material":"wood","position":[0,1.4,1.5],"dims":[2,2.8,3],"orient":0,"log":["declared(corridor, 2,2.8,3)","meet([0.00,1.00,0.00,-1.40]) → DOF_pos=2","meet([1.00,0.00,0.00,0.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-1.50]) → DOF_pos=0","resolved → (0.00,1.40,1.50)"],"fill":"#C8A060","edge":"#8A6830","opacity":0.5},{"id":"shoe_cabinet","type":"shoe_cabinet","material":"wood","position":[-0.825,0.65,1.5],"dims":[1,0.7,0.35],"orient":0,"log":["declared(shoe_cabinet, 1,0.7,0.35)","meet([0.00,1.00,0.00,-0.65]) → DOF_pos=2","meet([1.00,0.00,0.00,0.82]) → DOF_pos=1","meet([0.00,0.00,1.00,-1.50]) → DOF_pos=0","resolved → (-0.82,0.65,1.50)"],"fill":"#C8A060","edge":"#8A6830","opacity":0.5},{"id":"living_room","type":"living_room","material":"oak","position":[-1,1.5,7],"dims":[8,3,8],"orient":0,"log":["declared(living_room, 8,3,8)","meet([0.00,1.00,0.00,-1.50]) → DOF_pos=2","meet([1.00,0.00,0.00,1.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-7.00]) → DOF_pos=0","resolved → (-1.00,1.50,7.00)"],"fill":"#D4B878","edge":"#9A7840","opacity":0.5},{"id":"south_window","type":"floor_window","material":"glass","position":[-1,1.3,3],"dims":[5,2.6,0.08],"orient":0,"log":["declared(floor_window, 5,2.6,0.08)","meet([0.00,1.00,0.00,-1.30]) → DOF_pos=2","meet([1.00,0.00,0.00,1.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-3.00]) → DOF_pos=0","resolved → (-1.00,1.30,3.00)"],"fill":"#B8D8E8","edge":"#6A9AB8","opacity":0.15},{"id":"island","type":"island_counter","material":"stone","position":[-1,0.45,7],"dims":[2.2,0.9,1],"orient":0,"log":["declared(island_counter, 2.2,0.9,1)","meet([0.00,1.00,0.00,-0.45]) → DOF_pos=2","meet([1.00,0.00,0.00,1.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-7.00]) → DOF_pos=0","resolved → (-1.00,0.45,7.00)"],"fill":"#908478","edge":"#605448","opacity":0.55},{"id":"kitchen","type":"kitchen","material":"default","position":[-1,1.5,9.5],"dims":[4,3,3],"orient":0,"log":["declared(kitchen, 4,3,3)","meet([0.00,1.00,0.00,-1.50]) → DOF_pos=2","meet([1.00,0.00,0.00,1.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-9.50]) → DOF_pos=0","resolved → (-1.00,1.50,9.50)"],"fill":"#E0D8D0","edge":"#A89A90","opacity":0.4},{"id":"stool_1","type":"bar_stool","material":"wood","position":[0.5,0.375,6.7],"dims":[0.38,0.75,0.38],"orient":0,"log":["declared(bar_stool, 0.38,0.75,0.38)","meet([0.00,1.00,0.00,-0.38]) → DOF_pos=2","meet([1.00,0.00,0.00,-0.50]) → DOF_pos=1","meet([0.00,0.00,1.00,-6.70]) → DOF_pos=0","resolved → (0.50,0.38,6.70)"],"fill":"#C8A060","edge":"#8A6830","opacity":0.5},{"id":"stool_2","type":"bar_stool","material":"wood","position":[0.5,0.375,7.3],"dims":[0.38,0.75,0.38],"orient":0,"log":["declared(bar_stool, 0.38,0.75,0.38)","meet([0.00,1.00,0.00,-0.38]) → DOF_pos=2","meet([1.00,0.00,0.00,-0.50]) → DOF_pos=1","meet([0.00,0.00,1.00,-7.30]) → DOF_pos=0","resolved → (0.50,0.38,7.30)"],"fill":"#C8A060","edge":"#8A6830","opacity":0.5},{"id":"corridor","type":"corridor","material":"default","position":[5,1.4,6.5],"dims":[4,2.8,1.5],"orient":0,"log":["declared(corridor, 4,2.8,1.5)","meet([0.00,1.00,0.00,-1.40]) → DOF_pos=2","meet([1.00,0.00,0.00,-5.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-6.50]) → DOF_pos=0","resolved → (5.00,1.40,6.50)"],"fill":"#E0D8D0","edge":"#A89A90","opacity":0.4},{"id":"master_bedroom","type":"bedroom","material":"oak","position":[9,1.4,6],"dims":[4,2.8,4.5],"orient":0,"log":["declared(bedroom, 4,2.8,4.5)","meet([0.00,1.00,0.00,-1.40]) → DOF_pos=2","meet([1.00,0.00,0.00,-9.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-6.00]) → DOF_pos=0","resolved → (9.00,1.40,6.00)"],"fill":"#D4B878","edge":"#9A7840","opacity":0.5},{"id":"bay_window","type":"bay_window","material":"glass","position":[9,1.3,3.75],"dims":[2,2.6,0.5],"orient":0,"log":["declared(bay_window, 2,2.6,0.5)","meet([0.00,1.00,0.00,-1.30]) → DOF_pos=2","meet([1.00,0.00,0.00,-9.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-3.75]) → DOF_pos=0","resolved → (9.00,1.30,3.75)"],"fill":"#B8D8E8","edge":"#6A9AB8","opacity":0.15},{"id":"bed","type":"bed","material":"fabric","position":[10.1,0.275,6],"dims":[1.8,0.55,2.1],"orient":-90,"log":["declared(bed, 1.8,0.55,2.1)","meet([0.00,1.00,0.00,-0.28]) → DOF_pos=2","meet([1.00,0.00,0.00,-10.10]) → DOF_pos=1","meet([0.00,0.00,1.00,-6.00]) → DOF_pos=0","resolved → (10.10,0.28,6.00)","orient(-90°)"],"fill":"#D8C8B0","edge":"#A89880","opacity":0.5},{"id":"east_window","type":"window","material":"glass","position":[11,1.8,6],"dims":[1.2,1.4,0.08],"orient":0,"log":["declared(window, 1.2,1.4,0.08)","meet([0.00,1.00,0.00,-1.80]) → DOF_pos=2","meet([1.00,0.00,0.00,-11.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-6.00]) → DOF_pos=0","resolved → (11.00,1.80,6.00)"],"fill":"#B8D8E8","edge":"#6A9AB8","opacity":0.15},{"id":"closet","type":"walk_in_closet","material":"default","position":[10,1.4,8],"dims":[2,2.8,1.8],"orient":0,"log":["declared(walk_in_closet, 2,2.8,1.8)","meet([0.00,1.00,0.00,-1.40]) → DOF_pos=2","meet([1.00,0.00,0.00,-10.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-8.00]) → DOF_pos=0","resolved → (10.00,1.40,8.00)"],"fill":"#E0D8D0","edge":"#A89A90","opacity":0.4},{"id":"bathroom","type":"bathroom","material":"tile","position":[7.65,1.4,8],"dims":[2.5,2.8,2],"orient":0,"log":["declared(bathroom, 2.5,2.8,2)","meet([0.00,1.00,0.00,-1.40]) → DOF_pos=2","meet([1.00,0.00,0.00,-7.65]) → DOF_pos=1","meet([0.00,0.00,1.00,-8.00]) → DOF_pos=0","resolved → (7.65,1.40,8.00)"],"fill":"#E8D8C8","edge":"#B0A090","opacity":0.5},{"id":"l_counter","type":"L_counter","material":"stone","position":[-1,0.45,10.7],"dims":[3.5,0.9,0.6],"orient":0,"log":["declared(L_counter, 3.5,0.9,0.6)","meet([0.00,1.00,0.00,-0.45]) → DOF_pos=2","meet([1.00,0.00,0.00,1.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-10.70]) → DOF_pos=0","resolved → (-1.00,0.45,10.70)"],"fill":"#908478","edge":"#605448","opacity":0.55},{"id":"fridge","type":"refrigerator","material":"steel","position":[-2.3,0.9,10.5],"dims":[0.85,1.8,0.7],"orient":0,"log":["declared(refrigerator, 0.85,1.8,0.7)","meet([0.00,1.00,0.00,-0.90]) → DOF_pos=2","meet([1.00,0.00,0.00,2.30]) → DOF_pos=1","meet([0.00,0.00,1.00,-10.50]) → DOF_pos=0","resolved → (-2.30,0.90,10.50)"],"fill":"#CCCCCC","edge":"#888888","opacity":0.5},{"id":"pendant","type":"pendant_light","material":"metal","position":[-1,2.5,7],"dims":[0.4,0.2,0.4],"orient":0,"log":["declared(pendant_light, 0.4,0.2,0.4)","meet([0.00,1.00,0.00,-2.50]) → DOF_pos=2","meet([1.00,0.00,0.00,1.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-7.00]) → DOF_pos=0","resolved → (-1.00,2.50,7.00)"],"fill":"#AAAAAA","edge":"#666666","opacity":0.5},{"id":"sofa","type":"sofa","material":"fabric","position":[-4.55,0.4,5.5],"dims":[2.2,0.8,0.9],"orient":-90,"log":["declared(sofa, 2.2,0.8,0.9)","meet([0.00,1.00,0.00,-0.40]) → DOF_pos=2","meet([1.00,0.00,0.00,4.55]) → DOF_pos=1","meet([0.00,0.00,1.00,-5.50]) → DOF_pos=0","resolved → (-4.55,0.40,5.50)","orient(-90°)"],"fill":"#D8C8B0","edge":"#A89880","opacity":0.5},{"id":"dining_table","type":"dining_table","material":"wood","position":[-2,0.38,6],"dims":[1.6,0.76,0.9],"orient":0,"log":["declared(dining_table, 1.6,0.76,0.9)","meet([0.00,1.00,0.00,-0.38]) → DOF_pos=2","meet([1.00,0.00,0.00,2.00]) → DOF_pos=1","meet([0.00,0.00,1.00,-6.00]) → DOF_pos=0","resolved → (-2.00,0.38,6.00)"],"fill":"#C8A060","edge":"#8A6830","opacity":0.5}];
+const W=innerWidth,H=innerHeight;
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(W,H);renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.setClearColor(0xf5f2ed);renderer.localClippingEnabled=true;
+document.body.appendChild(renderer.domElement);
+const scene=new THREE.Scene();
+scene.fog=new THREE.Fog(0xf5f2ed,50,90);
+const cam=new THREE.PerspectiveCamera(28,W/H,.1,200);
+scene.add(new THREE.AmbientLight(0xffffff,.45));
+const sun=new THREE.DirectionalLight(0xFFF8EE,.55);
+sun.position.set(12,25,15);sun.castShadow=true;
+sun.shadow.camera.left=-20;sun.shadow.camera.right=20;
+sun.shadow.camera.top=20;sun.shadow.camera.bottom=-20;
+sun.shadow.mapSize.set(2048,2048);scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xD4E4F4,0xE8DCC8,.25));
+const gnd=new THREE.Mesh(new THREE.PlaneGeometry(80,80),new THREE.MeshLambertMaterial({color:0xE8E4DC}));
+gnd.rotation.x=-Math.PI/2;gnd.position.y=-.01;gnd.receiveShadow=true;scene.add(gnd);
+scene.add(new THREE.GridHelper(40,40,0xd8d4cc,0xe0dcd4));
+const clip=new THREE.Plane(new THREE.Vector3(0,-1,0),20);
+const fills=[],edges=[];
+M.forEach(m=>{
+  const g=new THREE.BoxGeometry(m.dims[0],m.dims[1],m.dims[2]);
+  const mat=new THREE.MeshLambertMaterial({color:new THREE.Color(m.fill),transparent:true,opacity:m.opacity,side:2,clippingPlanes:[clip]});
+  const mesh=new THREE.Mesh(g,mat);
+  mesh.position.set(m.position[0],m.position[1],m.position[2]);
+  if(m.orient)mesh.rotation.y=m.orient*Math.PI/180;
+  mesh.castShadow=m.opacity>.3;mesh.receiveShadow=true;
+  scene.add(mesh);fills.push(mesh);
+  const eg=new THREE.EdgesGeometry(g);
+  const lm=new THREE.LineBasicMaterial({color:new THREE.Color(m.edge),transparent:true,opacity:m.opacity>.2?.65:.25,clippingPlanes:[clip]});
+  const wire=new THREE.LineSegments(eg,lm);
+  wire.position.copy(mesh.position);wire.rotation.copy(mesh.rotation);
+  scene.add(wire);edges.push(wire);
+  if(m.type.includes('room')||m.type.includes('kitchen')||m.type.includes('bedroom')||m.type.includes('corridor')||m.type.includes('bathroom')){
+    const c=document.createElement('canvas');c.width=256;c.height=48;
+    const x=c.getContext('2d');x.font='bold 18px system-ui';x.fillStyle='rgba(80,70,55,.5)';
+    x.textAlign='center';x.fillText(m.type.replace(/_/g,' '),128,32);
+    const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),transparent:true}));
+    sp.position.set(m.position[0],.05,m.position[2]);sp.scale.set(2.5,.5,1);scene.add(sp);
+  }
+});
+let theta=Math.PI*.28,phi=Math.PI*.18,radius=28;
+const tgt=new THREE.Vector3(0,2,0);
+function uc(){cam.position.set(tgt.x+radius*Math.cos(phi)*Math.sin(theta),tgt.y+radius*Math.sin(phi),tgt.z+radius*Math.cos(phi)*Math.cos(theta));cam.lookAt(tgt)}
+uc();
+let dr=false,px=0,py=0;
+renderer.domElement.addEventListener('pointerdown',e=>{dr=true;px=e.clientX;py=e.clientY;renderer.domElement.setPointerCapture(e.pointerId)});
+renderer.domElement.addEventListener('pointermove',e=>{if(!dr)return;theta-=(e.clientX-px)*.006;phi=Math.max(.02,Math.min(1.4,phi+(e.clientY-py)*.006));px=e.clientX;py=e.clientY;uc()});
+renderer.domElement.addEventListener('pointerup',()=>dr=false);
+renderer.domElement.addEventListener('wheel',e=>{radius=Math.max(5,Math.min(70,radius+e.deltaY*.04));uc();e.preventDefault()},{passive:false});
+window.addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+window.setMode=function(mode){
+  document.querySelectorAll('.btn').forEach(b=>b.classList.remove('on'));
+  event.target.classList.add('on');
+  fills.forEach(m=>{m.visible=mode!=='wire';if(mode==='xray')m.material.opacity=.08;else m.material.opacity=parseFloat(m.material.userData?.origOp||m.material.opacity);});
+  edges.forEach(w=>{w.material.opacity=mode==='wire'?.8:.65;w.visible=true});
+};
+window.setCut=function(v){clip.constant=v*.12};
+(function loop(){requestAnimationFrame(loop);renderer.render(scene,cam)})();
+</script></body></html>
