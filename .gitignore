@@ -1,0 +1,80 @@
+# ==============================
+# Node 依赖 (Dependencies)
+# ==============================
+node_modules/
+package-lock.json # 如果你强制使用 yarn 或 pnpm，可以取消注释此行以忽略 npm 的锁文件
+# yarn.lock       # 如果你强制使用 npm 或 pnpm，可以取消注释此行以忽略 yarn 的锁文件
+# pnpm-lock.yaml  # 如果你强制使用 npm 或 yarn，可以取消注释此行以忽略 pnpm 的锁文件
+
+# ==============================
+# 编译输出 (Compiled Output)
+# ==============================
+dist/
+build/
+out/
+lib/
+# TypeScript 增量编译生成的缓存文件
+*.tsbuildinfo
+
+# ==============================
+# 日志文件 (Logs)
+# ==============================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==============================
+# 测试与覆盖率 (Testing & Coverage)
+# ==============================
+coverage/
+.nyc_output/
+
+# ==============================
+# 环境变量与机密文件 (Environment & Secrets)
+# ==============================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.pem
+
+# ==============================
+# 操作系统生成文件 (OS Files)
+# ==============================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==============================
+# 编辑器与 IDE 配置 (Editor & IDE)
+# ==============================
+.idea/
+.vscode/*
+# 保留 VS Code 中推荐的扩展和设置（如果你的团队需要共享）
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ==============================
+# 框架特定 (Framework Specific) 
+# 如果你使用特定框架，取消相关注释
+# ==============================
+# .next/       # Next.js
+# .nuxt/       # Nuxt.js
+# .vuepress/dist # VuePress
+# .serverless/ # Serverless

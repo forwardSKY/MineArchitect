@@ -322,12 +322,12 @@ function runTest(name: string, sentences: string[], ops: Op[][]): PipelineResult
 
 // Run apartment
 const apt = runTest('Apartment (23 sentences, 21 entities)', APARTMENT_SENTENCES, APARTMENT_OPS);
-writeFileSync('/mnt/user-data/outputs/apartment.html', apt.html);
+writeFileSync('apartment.html', apt.html);
 console.log('  → Wrote /mnt/user-data/outputs/apartment.html');
 
 // Run bridge
 const bridge = runTest('Bridge (6 sentences, 5 entities)', BRIDGE_SENTENCES, BRIDGE_OPS);
-writeFileSync('/mnt/user-data/outputs/bridge.html', bridge.html);
+writeFileSync('bridge.html', bridge.html);
 console.log('  → Wrote /mnt/user-data/outputs/bridge.html');
 
 console.log(`\n${'═'.repeat(60)}`);

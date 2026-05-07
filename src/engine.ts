@@ -13,6 +13,26 @@
 
 import { Plane, meetPlanes, planesIndependent, P } from './pga';
 
+// ─── 约束 DSL 类型 ──────────────────────────────────────────────
+export type Face = 'east' | 'west' | 'north' | 'south' | 'top' | 'bottom';
+
+export type Constraint =
+  | { kind: 'on_floor' }
+  | { kind: 'at_height'; y: number }
+  | { kind: 'against'; of: string; face: Face; gap?: number }
+  | { kind: 'on_top_of'; of: string }
+  | { kind: 'centered_in'; of: string; axis: 'x' | 'z' }
+  | { kind: 'aligned_face'; of: string; face: Face }
+  | { kind: 'offset_from'; of: string; axis: 'x' | 'y' | 'z'; delta: number }
+  | { kind: 'plane'; coeffs: Plane };   // 逃生舱
+
+// ─── 操作扩增 ──────────────────────────────────────────────────
+export type Op =
+  | { op: 'declare'; id: string; type: string; dims: [number, number, number]; material?: string }
+  | { op: 'meet'; entity: string; plane: Plane }                           // 保留旧方式
+  | { op: 'constrain'; entity: string; constraint: Constraint }            // 新 DSL
+  | { op: 'orient'; entity: string; angle: number };
+
 export interface Entity {
   id: string;
   type: string;
@@ -33,6 +53,8 @@ export interface Entity {
 
   /** Applied operations log */
   log: string[];
+  /** 尚未能解析的约束（因为引用的实体还未解算） */
+  deferred: Constraint[];
 }
 
 export interface EngineState {
@@ -41,12 +63,6 @@ export interface EngineState {
   totalDOF: number;
 }
 
-// ─── Operations (the Agent's action space) ──────────────────────
-
-export type Op =
-  | { op: 'declare'; id: string; type: string; dims: [number, number, number]; material?: string }
-  | { op: 'meet'; entity: string; plane: [number, number, number, number] }
-  | { op: 'orient'; entity: string; angle: number };
 
 // ─── Engine ─────────────────────────────────────────────────────
 
@@ -58,7 +74,7 @@ export function execute(state: EngineState, op: Op): string {
   switch (op.op) {
     case 'declare': {
       if (state.entities.has(op.id)) return `warn: ${op.id} already declared`;
-      const e: Entity = {
+            const e: Entity = {
         id: op.id,
         type: op.type,
         dims: op.dims,
@@ -67,6 +83,7 @@ export function execute(state: EngineState, op: Op): string {
         position: null,
         orient: null,
         dofPos: 3,
+        deferred: [],
         log: [`declared(${op.type}, ${op.dims})`],
       };
       state.entities.set(op.id, e);
@@ -116,6 +133,13 @@ export function execute(state: EngineState, op: Op): string {
       e.log.push(`orient(${op.angle}°)`);
       return `ok: ${op.entity} orient=${op.angle}°`;
     }
+
+    case 'constrain': {
+      return `error: constrain not implemented yet`;
+    }
+
+    default:
+      return `error: unknown operation`;
   }
 }
 
