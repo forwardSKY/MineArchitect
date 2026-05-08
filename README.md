@@ -5,6 +5,35 @@
 ---
 ![architecture design](pictures/professional_architect.jpg)
 
+## Core Principle
+
+Every rigid body in 3D has 4 DOF (3 position + 1 heading). Each `meet(entity, plane)` constrains the entity to lie on a plane, reducing positional DOF by 1. Three independent planes intersect at exactly one point:
+
+```
+π₁ ∧ π₂ ∧ π₃ = P       (PGA triple-meet)
+```
+
+This is solved via Cramer's rule on the 3×3 coefficient matrix of the three plane equations. The agent's job is to translate spatial language into plane equations. The algebra handles the rest.
+
+**Agent action space — 3 operations:**
+
+| Operation | Effect | Example |
+|-----------|--------|---------|
+| `declare(id, type, dims)` | Register entity, DOF=4 | `declare("bed", "bed", [1.8, 0.55, 2.1])` |
+| `meet(entity, [nx,ny,nz,d])` | Constrain with plane, DOF−1 | `meet("bed", [1, 0, 0, -10.1])` → x=10.1 |
+| `orient(entity, angle)` | Set heading, DOF−1 | `orient("bed", -90)` → facing east |
+
+
+## Convergence Guarantee
+
+Total DOF = 4N. Each operation reduces DOF by 1. DOF ≥ 0. Therefore convergence is guaranteed in at most 4N steps. The question is only what percentage comes from text vs. defaults:
+
+```
+Apartment (N=21):  text=77%, defaults=23%
+Office (N=123):    text=75%, defaults=25%  (orientation defaults)
+```
+
+
 ## Quick Start
 
 ### 1. Environment
@@ -82,36 +111,6 @@ Once completed, the script will generate output_*.html files in your directory. 
 > A 6-story modern office building with 24m×16m footprint. 5×4 column grid, cantilevered slabs, glass curtain walls on all sides...
 
 ![architecture design](pictures/office_tower.png)
-
-
-
-## Core Principle
-
-Every rigid body in 3D has 4 DOF (3 position + 1 heading). Each `meet(entity, plane)` constrains the entity to lie on a plane, reducing positional DOF by 1. Three independent planes intersect at exactly one point:
-
-```
-π₁ ∧ π₂ ∧ π₃ = P       (PGA triple-meet)
-```
-
-This is solved via Cramer's rule on the 3×3 coefficient matrix of the three plane equations. The agent's job is to translate spatial language into plane equations. The algebra handles the rest.
-
-**Agent action space — 3 operations:**
-
-| Operation | Effect | Example |
-|-----------|--------|---------|
-| `declare(id, type, dims)` | Register entity, DOF=4 | `declare("bed", "bed", [1.8, 0.55, 2.1])` |
-| `meet(entity, [nx,ny,nz,d])` | Constrain with plane, DOF−1 | `meet("bed", [1, 0, 0, -10.1])` → x=10.1 |
-| `orient(entity, angle)` | Set heading, DOF−1 | `orient("bed", -90)` → facing east |
-
-
-## Convergence Guarantee
-
-Total DOF = 4N. Each operation reduces DOF by 1. DOF ≥ 0. Therefore convergence is guaranteed in at most 4N steps. The question is only what percentage comes from text vs. defaults:
-
-```
-Apartment (N=21):  text=77%, defaults=23%
-Office (N=123):    text=75%, defaults=25%  (orientation defaults)
-```
 
 
 ## Architecture
