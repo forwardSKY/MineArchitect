@@ -33,6 +33,12 @@ export type Op =
   | { op: 'constrain'; entity: string; constraint: Constraint }            // 新 DSL
   | { op: 'orient'; entity: string; angle: number };
 
+  // ─── 约束解析结果 ──────────────────────────────────────────────
+type Resolved =
+  | { plane: Plane }
+  | { defer: string }    // 被引用实体尚未解析
+  | { error: string };
+  
 export interface Entity {
   id: string;
   type: string;
@@ -63,6 +69,157 @@ export interface EngineState {
   totalDOF: number;
 }
 
+/** 将符号约束解析为具体平面，如果依赖的实体未就绪则返回 defer */
+function resolveConstraint(
+  state: EngineState,
+  entityId: string,
+  constraint: Constraint
+): Resolved {
+  const e = state.entities.get(entityId);
+  if (!e) return { error: `entity ${entityId} not found` };
+
+  // 辅助：获取一个引用实体的位置和尺寸，未声明或未解析则 defer
+  const needRef = (id: string) => {
+    const ref = state.entities.get(id);
+    if (!ref) return { error: `ref entity ${id} not declared` };
+    if (!ref.position) return { defer: id };
+    return { ref };
+  };
+
+  switch (constraint.kind) {
+    case 'on_floor':
+      return { plane: P.y(e.dims[1] / 2) };
+
+    case 'at_height':
+      return { plane: P.y(constraint.y + e.dims[1] / 2) };
+
+    case 'against': {
+      const needed = needRef(constraint.of);
+      if ('error' in needed) return { error: needed.error! };
+      if ('defer' in needed) return { defer: needed.defer! };
+      const { ref } = needed;
+      const [rx, ry, rz] = ref.position!;
+      const [rw, rh, rd] = ref.dims;
+      const [ew, eh, ed] = e.dims;
+      const g = constraint.gap ?? 0;
+      // 实体放在目标面内侧：目标表面坐标 → 向内侧偏移半个宽度
+      switch (constraint.face) {
+        case 'east':   return { plane: P.x(rx + rw / 2 - ew / 2 - g) };
+        case 'west':   return { plane: P.x(rx - rw / 2 + ew / 2 + g) };
+        case 'north':  return { plane: P.z(rz + rd / 2 - ed / 2 - g) };
+        case 'south':  return { plane: P.z(rz - rd / 2 + ed / 2 + g) };
+        case 'top':    return { plane: P.y(ry + rh / 2 + eh / 2 + g) };
+        case 'bottom': return { plane: P.y(ry - rh / 2 - eh / 2 - g) };
+      }
+    }
+
+    case 'on_top_of': {
+      const needed = needRef(constraint.of);
+      if ('error' in needed) return { error: needed.error! };
+      if ('defer' in needed) return { defer: needed.defer! };
+      const { ref } = needed;
+      
+      const top = ref.position![1] + ref.dims[1] / 2;
+      return { plane: P.y(top + e.dims[1] / 2) };
+    }
+
+    case 'centered_in': {
+      const needed = needRef(constraint.of);
+      if ('error' in needed) return { error: needed.error! };
+      if ('defer' in needed) return { defer: needed.defer! };
+      const { ref } = needed;
+      
+      const idx = constraint.axis === 'x' ? 0 : 2;
+      const makePlane = constraint.axis === 'x' ? P.x : P.z;
+      return { plane: makePlane(ref.position![idx]) };
+    }
+
+    case 'aligned_face': {
+      const needed = needRef(constraint.of);
+      if ('error' in needed) return { error: needed.error! };
+      if ('defer' in needed) return { defer: needed.defer! };
+      const { ref } = needed;
+      
+      const [rx, ry, rz] = ref.position!;
+      const [rw, rh, rd] = ref.dims;
+      const [ew, eh, ed] = e.dims;
+      switch (constraint.face) {
+        case 'east':   return { plane: P.x(rx + rw / 2 - ew / 2) };
+        case 'west':   return { plane: P.x(rx - rw / 2 + ew / 2) };
+        case 'north':  return { plane: P.z(rz + rd / 2 - ed / 2) };
+        case 'south':  return { plane: P.z(rz - rd / 2 + ed / 2) };
+        case 'top':    return { plane: P.y(ry + rh / 2 - eh / 2) };
+        case 'bottom': return { plane: P.y(ry - rh / 2 + eh / 2) };
+      }
+    }
+
+    case 'offset_from': {
+      const needed = needRef(constraint.of);
+      if ('error' in needed) return { error: needed.error! };
+      if ('defer' in needed) return { defer: needed.defer! };
+      const { ref } = needed;
+      
+      const idx = constraint.axis === 'x' ? 0 : constraint.axis === 'y' ? 1 : 2;
+      const makePlane = constraint.axis === 'x' ? P.x : constraint.axis === 'y' ? P.y : P.z;
+      return { plane: makePlane(ref.position![idx] + constraint.delta) };
+    }
+
+    case 'plane':
+      return { plane: constraint.coeffs };
+  }
+}
+
+/** 将一个新平面应用到实体上（独立性检查、减 DOF、尝试解位置） */
+function applyPlane(
+  state: EngineState,
+  entity: Entity,
+  plane: Plane
+): string {
+  // 独立性检查
+  for (const existing of entity.planes) {
+    if (!planesIndependent(existing, plane)) {
+      return `skip: parallel plane on ${entity.id}`;
+    }
+  }
+
+  entity.planes.push(plane);
+  entity.dofPos--;
+  state.totalDOF--;
+  entity.log.push(`meet([${plane.map(v => v.toFixed(2))}]) → DOF_pos=${entity.dofPos}`);
+
+  if (entity.planes.length >= 3 && !entity.position) {
+    const pos = meetPlanes(entity.planes[0], entity.planes[1], entity.planes[2]);
+    if (pos) {
+      entity.position = pos;
+      entity.log.push(`resolved → (${pos.map(v => v.toFixed(2))})`);
+      return `ok: ${entity.id} resolved at (${pos.map(v => v.toFixed(2))})`;
+    }
+  }
+  return `ok: ${entity.id} DOF_pos=${entity.dofPos}`;
+}
+
+/** 每次成功添加平面后，尝试处理所有实体的挂起约束 */
+function flushDeferred(state: EngineState): void {
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (const e of state.entities.values()) {
+      if (e.dofPos <= 0 || e.deferred.length === 0) continue;
+      const remaining: Constraint[] = [];
+      for (const c of e.deferred) {
+        const res = resolveConstraint(state, e.id, c);
+        if ('plane' in res) {
+          applyPlane(state, e, res.plane);
+          progress = true;
+        } else if ('defer' in res) {
+          remaining.push(c);   // 仍无法解析，保留
+        }
+        // error 则丢弃（引用实体可能被删？实际不会）
+      }
+      e.deferred = remaining;
+    }
+  }
+}
 
 // ─── Engine ─────────────────────────────────────────────────────
 
@@ -90,37 +247,12 @@ export function execute(state: EngineState, op: Op): string {
       state.totalDOF += 4; // 3 position + 1 orientation
       return `ok: declared ${op.id}, DOF=4`;
     }
-
+    
     case 'meet': {
       const e = state.entities.get(op.entity);
       if (!e) return `error: entity ${op.entity} not found`;
       if (e.dofPos <= 0) return `skip: ${op.entity} position already resolved`;
-
-      const plane: Plane = op.plane as Plane;
-
-      // Check independence with existing planes
-      for (const existing of e.planes) {
-        if (!planesIndependent(existing, plane)) {
-          return `skip: plane is parallel to existing constraint on ${op.entity}`;
-        }
-      }
-
-      e.planes.push(plane);
-      e.dofPos--;
-      state.totalDOF--;
-      e.log.push(`meet([${plane.map(v => v.toFixed(2))}]) → DOF_pos=${e.dofPos}`);
-
-      // Try to resolve position if we have 3 planes
-      if (e.planes.length >= 3 && !e.position) {
-        const pos = meetPlanes(e.planes[0], e.planes[1], e.planes[2]);
-        if (pos) {
-          e.position = pos;
-          e.log.push(`resolved → (${pos.map(v => v.toFixed(2))})`);
-          return `ok: ${op.entity} position resolved at (${pos.map(v => v.toFixed(2))})`;
-        }
-      }
-
-      return `ok: ${op.entity} DOF_pos=${e.dofPos}`;
+      return applyPlane(state, e, op.plane as Plane);
     }
 
     case 'orient': {
@@ -133,9 +265,23 @@ export function execute(state: EngineState, op: Op): string {
       e.log.push(`orient(${op.angle}°)`);
       return `ok: ${op.entity} orient=${op.angle}°`;
     }
-
+    
     case 'constrain': {
-      return `error: constrain not implemented yet`;
+      const e = state.entities.get(op.entity);
+      if (!e) return `error: entity ${op.entity} not found`;
+      if (e.dofPos <= 0) return `skip: ${op.entity} already resolved`;
+
+      const result = resolveConstraint(state, op.entity, op.constraint);
+      if ('error' in result) return `error: ${result.error}`;
+      if ('defer' in result) {
+        e.deferred.push(op.constraint);
+        return `defer: ${op.entity} waiting on ${result.defer}`;
+      }
+      // 成功解析为平面 → 应用
+      const msg = applyPlane(state, e, result.plane);
+      // 应用后刷新所有待处理约束（可能解锁其他实体）
+      flushDeferred(state);
+      return msg;
     }
 
     default:
@@ -146,6 +292,35 @@ export function execute(state: EngineState, op: Op): string {
 /** Execute a batch of operations, return logs */
 export function executeBatch(state: EngineState, ops: Op[]): string[] {
   return ops.map(op => execute(state, op));
+}
+
+/** 深拷贝引擎状态，用于失败回滚 */
+export function cloneEngine(s: EngineState): EngineState {
+  const cloned: EngineState = { entities: new Map(), totalDOF: s.totalDOF };
+  for (const [id, e] of s.entities) {
+    cloned.entities.set(id, {
+      id: e.id,
+      type: e.type,
+      dims: [...e.dims] as [number, number, number],
+      material: e.material,
+      planes: e.planes.map(p => [...p] as Plane),
+      position: e.position ? [...e.position] as [number, number, number] : null,
+      orient: e.orient,
+      dofPos: e.dofPos,
+      deferred: [...e.deferred],
+      log: [...e.log],
+    });
+  }
+  return cloned;
+}
+
+/** 将一个引擎的状态完整写入另一个引擎 */
+export function commitInto(target: EngineState, source: EngineState): void {
+  target.entities.clear();
+  for (const [id, e] of source.entities) {
+    target.entities.set(id, e);
+  }
+  target.totalDOF = source.totalDOF;
 }
 
 // ─── Queries (what the Agent reads as context) ───────────────────

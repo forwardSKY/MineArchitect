@@ -8,10 +8,20 @@
  * Render:  0 LLM calls, pure template
  */
 
-import { createEngine, execute, executeBatch, buildContext, fillDefaults, solvedEntities, Op } from './engine';
-import { STAGE1_PROMPT, STAGE2_PROMPT } from './prompts';
+import {
+  createEngine, execute, executeBatch, buildContext,
+  fillDefaults, solvedEntities, Op, Entity,
+  cloneEngine, commitInto, EngineState
+} from './engine';import { STAGE1_PROMPT, STAGE2_PROMPT } from './prompts';
 
 export type LLMCall = (system: string, user: string) => Promise<string>;
+
+/** 每一句处理的上下文 */
+interface SentenceCtx {
+  allSentences: string[];
+  index: number;
+  recentWindow: number;
+}
 
 export interface PipelineResult {
   normalized: string[];
@@ -22,6 +32,8 @@ export interface PipelineResult {
 }
 
 /** Full pipeline: raw text → HTML */
+/** Full pipeline: raw text → HTML */
+/** Full pipeline: raw text → HTML */
 export async function run(
   input: string,
   callLLM: LLMCall,
@@ -31,20 +43,18 @@ export async function run(
   const sentences = normText.split('\n').map(s => s.trim()).filter(s => s.length > 0);
 
   // ── Stage 2: Solve ──
-  const engine = createEngine();
+  // THIS IS THE MISSING LINE YOUR EDITOR IS COMPLAINING ABOUT:
+  const engine = createEngine(); 
   let totalOps = 0;
 
   for (let i = 0; i < sentences.length; i++) {
-    const ctx = buildContext(engine);
-    const prompt =
-      `${ctx}\n\n== FULL TEXT ==\n${sentences.join('\n')}\n\n` +
-      `== CURRENT SENTENCE (${i + 1}/${sentences.length}) ==\n${sentences[i]}\n\n` +
-      `Output the PGA operations for this sentence as JSON {"ops":[...]}`;
-
-    const resp = await callLLM(STAGE2_PROMPT, prompt);
-    const ops = parseOps(resp);
-    executeBatch(engine, ops);
-    totalOps += ops.length;
+    const ctx: SentenceCtx = {
+      allSentences: sentences,
+      index: i,
+      recentWindow: 4   // 展示最近4句，可根据需要调整
+    };
+    const result = await solveSentence(engine, ctx, callLLM);
+    totalOps += result.logs.length;  
   }
 
   // Fill any remaining DOF
@@ -63,6 +73,7 @@ export async function run(
   };
 }
 
+
 /** Parse JSON ops from LLM response */
 function parseOps(raw: string): Op[] {
   try {
@@ -76,6 +87,71 @@ function parseOps(raw: string): Op[] {
   } catch {
     return [];
   }
+}
+
+/** 处理单个句子的 Agent Loop，带重试和反馈 */
+async function solveSentence(
+  engine: EngineState,
+  ctx: SentenceCtx,
+  callLLM: LLMCall,
+  maxAttempts = 3
+): Promise<{ ok: boolean; attempts: number; logs: string[] }> {
+  let feedback = '';
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // 1. 克隆引擎，在副本上尝试
+    const trial = cloneEngine(engine);
+    const dofBefore = trial.totalDOF;
+
+    // 2. 构建 prompt（目前使用全量上下文）
+    const current = ctx.allSentences[ctx.index];
+    const recent = ctx.allSentences.slice(
+      Math.max(0, ctx.index - ctx.recentWindow),
+      ctx.index
+    );
+    let prompt = buildContext(trial);
+    prompt += `\n\n== RECENT SENTENCES ==\n`;
+    recent.forEach((s, i) => prompt += `[${ctx.index - recent.length + i + 1}] ${s}\n`);
+    prompt += `\n== CURRENT SENTENCE (${ctx.index + 1}/${ctx.allSentences.length}) ==\n${current}\n`;
+    if (feedback) prompt += `\n== FEEDBACK FROM PREVIOUS ATTEMPT ==\n${feedback}\n`;
+    prompt += `\nOutput the PGA operations for this sentence as JSON {"ops":[...]}`;
+
+    // 3. 调用 LLM
+    const resp = await callLLM(STAGE2_PROMPT, prompt);
+    const ops = parseOps(resp);
+
+    // 4. 空操作直接成功
+    if (ops.length === 0) {
+      return { ok: true, attempts: attempt, logs: ['no-op'] };
+    }
+
+    // 5. 在副本上执行操作
+    const logs = executeBatch(trial, ops);
+
+    // 6. 检查结果
+    const errors = logs.filter(l => l.startsWith('error'));
+    const dofReduced = dofBefore - trial.totalDOF;
+    const hasDeclare = ops.some(o => o.op === 'declare');
+
+    // 接受条件：无错误，且 (有 declare 或 DOF 确实下降)
+    const ok = errors.length === 0 && (hasDeclare || dofReduced > 0);
+
+    if (ok) {
+      // 成功：将副本状态写回主引擎
+      commitInto(engine, trial);
+      return { ok: true, attempts: attempt, logs };
+    }
+
+    // 失败：构建反馈并准备重试
+    feedback =
+      `Attempt ${attempt} rejected.\n` +
+      (errors.length ? `Errors: ${errors.join('; ')}\n` : '') +
+      `DOF before=${dofBefore} after=${trial.totalDOF} (need to decrease).\n` +
+      `Common issues: parallel/duplicate planes, wrong face name, referencing undeclared id.`;
+  }
+
+  // 超过最大重试次数
+  return { ok: false, attempts: maxAttempts, logs: ['gave up after retries'] };
 }
 
 /** Direct pipeline: skip LLM, provide ops per sentence directly */
