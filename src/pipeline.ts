@@ -14,6 +14,7 @@ import {
   cloneEngine, commitInto, EngineState
 } from './engine';import { STAGE1_PROMPT, STAGE2_PROMPT } from './prompts';
 
+type DeclareOp = Extract<Op, { op: 'declare' }>;
 export type LLMCall = (system: string, user: string) => Promise<string>;
 
 /** 每一句处理的上下文 */
@@ -53,7 +54,7 @@ export async function run(
       index: i,
       recentWindow: 4   // 展示最近4句，可根据需要调整
     };
-    const result = await solveSentence(engine, ctx, callLLM);
+    const result = await solveSentenceWithVoting(engine, ctx, callLLM);
     totalOps += result.logs.length;  
   }
 
@@ -215,6 +216,12 @@ async function solveSentence(
     const ok = errors.length === 0 && (hasDeclare || dofReduced > 0);
 
     if (ok) {
+      // 在提交之前，运行几何不变量
+      const violations = checkInvariants(trial, ops);
+      if (violations.length > 0) {
+        feedback = `Geometry violations:\n${violations.join('\n')}\nPlease adjust constraints.`;
+        continue; // 重新尝试
+      }
       // 成功：将副本状态写回主引擎
       commitInto(engine, trial);
       return { ok: true, attempts: attempt, logs };
@@ -231,6 +238,153 @@ async function solveSentence(
   // 超过最大重试次数
   return { ok: false, attempts: maxAttempts, logs: ['gave up after retries'] };
 }
+
+
+/** 轻量几何合理性检查，返回错误消息数组 */
+function checkInvariants(engine: EngineState, recentOps: Op[]): string[] {
+  const violations: string[] = [];
+  // 检查所有最近被操作过的实体
+  const touched = new Set(recentOps.map(o => 'entity' in o ? o.entity : o.id).filter(Boolean));
+  for (const id of touched) {
+    const e = engine.entities.get(id as string);
+    if (!e || !e.position) continue;
+    const [x, y, z] = e.position;
+    // 1. 禁止陷入地下
+    if (y < -0.01) {
+      violations.push(`${id}: y=${y.toFixed(2)} is below ground`);
+    }
+    // 2. 对于 against/centered_in 等约束，检查是否脱离父实体太远？
+    // 简单检查：如果实体期望在某个房间内，应基本在房间 AABB 内（省略，可后续加）
+  }
+  return violations;
+}
+
+// 多数决
+function mode<T>(arr: T[]): T {
+  const counts = new Map<string, number>();
+  arr.forEach(item => {
+    const key = JSON.stringify(item);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  return JSON.parse(sorted[0][0]);
+}
+
+// 中位数（防离群）
+function median(arr: number[]): number {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted[mid];
+}
+
+// 从多个样本中投票出 declare 操作列表
+function voteDeclares(samples: Op[][], minVotes: number): Op[] {
+  const declares: Op[] = [];
+  const byId = new Map<string, DeclareOp[]>();
+  for (const ops of samples) {
+    for (const o of ops) {
+      if (o.op !== 'declare') continue;
+      if (!byId.has(o.id)) byId.set(o.id, []);
+      byId.get(o.id)!.push(o as DeclareOp);   // 类型窄化
+    }
+  }
+  for (const [id, list] of byId) {
+    if (list.length < minVotes) continue;
+    const types = list.map(d => d.type);
+    const typeMode = mode(types);
+    const dims0 = median(list.map(d => d.dims[0]));
+    const dims1 = median(list.map(d => d.dims[1]));
+    const dims2 = median(list.map(d => d.dims[2]));
+    const materials = list.map(d => d.material ?? 'default');
+    const matMode = mode(materials);
+    declares.push({
+      op: 'declare', id,
+      type: typeMode,
+      dims: [dims0, dims1, dims2],
+      material: matMode,
+    });
+  }
+  return declares;
+}
+
+async function solveSentenceWithVoting(
+  engine: EngineState,
+  ctx: SentenceCtx,
+  callLLM: LLMCall,
+  k = 3,
+  maxAttempts = 2
+): Promise<{ ok: boolean; attempts: number; logs: string[] }> {
+  // 1. 探针调用，判断是否含 declare
+  const probePrompt = buildScopedContext(engine, ctx, '') + '\nOutput JSON.';
+  const probeResp = await callLLM(STAGE2_PROMPT, probePrompt);
+  const probeOps = parseOps(probeResp);
+  const hasDeclare = probeOps.some(o => o.op === 'declare');
+
+  if (!hasDeclare) {
+    // 无 declare，走标准 Agent Loop（但要包含 probeOps 作为第一次尝试）
+    const trial = cloneEngine(engine);
+    const dofBefore = trial.totalDOF;
+    const logs = executeBatch(trial, probeOps);
+    const errors = logs.filter(l => l.startsWith('error'));
+    const dofReduced = dofBefore - trial.totalDOF;
+    if (errors.length === 0 && (probeOps.length === 0 || dofReduced > 0)) {
+      commitInto(engine, trial);
+      return { ok: true, attempts: 1, logs };
+    }
+    // 否则走普通重试循环（这里可以复用 solveSentence，但简单起见我们直接循环）
+    return solveSentence(engine, ctx, callLLM, maxAttempts);
+  }
+
+  // 2. 有 declare，再采集 k-1 次
+  const extraResponses = await Promise.all(
+    Array.from({ length: k - 1 }, () =>
+      callLLM(STAGE2_PROMPT, buildScopedContext(engine, ctx, '') + '\nOutput JSON.')
+    )
+  );
+  const samples = [probeOps, ...extraResponses.map(parseOps)];
+
+  // 3. 投票得出 declare 操作
+  const declaredOps = voteDeclares(samples, Math.ceil(k / 2));
+  // 如果投票失败，可以回退到只有 probeOps 或使用默认尺寸，这里简单处理：若投票为空，则直接用 probeOps
+  const restOps = pickAlignedRest(samples, declaredOps);
+  const finalOps = declaredOps.length > 0 ? [...declaredOps, ...restOps] : probeOps;
+
+  // 4. 执行最终 ops，带一次重试（类似 solveSentence 的逻辑）
+  let feedback = '';
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const trial = cloneEngine(engine);
+    const dofBefore = trial.totalDOF;
+    const logs = executeBatch(trial, finalOps);
+    const errors = logs.filter(l => l.startsWith('error'));
+    const dofReduced = dofBefore - trial.totalDOF;
+    const ok = errors.length === 0 && (finalOps.length === 0 || dofReduced > 0);
+    if (ok) {
+      // 几何检查（复用）
+      const violations = checkInvariants(trial, finalOps);
+      if (violations.length === 0) {
+        commitInto(engine, trial);
+        return { ok: true, attempts: attempt, logs };
+      }
+      feedback = `Geometry violations:\n${violations.join('\n')}\nPlease fix.`;
+    } else {
+      feedback = `Attempt ${attempt} failed.\nErrors: ${errors.join('; ')}`;
+    }
+    // 重试时重新生成 ops（这里暂用 finalOps 不变，简单起见；也可重新调用 LLM）
+    // 为了精简，可以在重试时再调用一次 LLM 获得新的 ops
+    if (attempt < maxAttempts) {
+      const retryResp = await callLLM(STAGE2_PROMPT, buildScopedContext(engine, ctx, feedback) + '\nOutput JSON.');
+      finalOps.splice(0, finalOps.length, ...parseOps(retryResp));
+    }
+  }
+  return { ok: false, attempts: maxAttempts, logs: [] };
+}
+
+// 选择一个样本的非 declare 操作，选择标准：其 declare 与投票得出的 declare 最相似
+function pickAlignedRest(samples: Op[][], votedDeclares: Op[]): Op[] {
+  // 简单实现：取第一个样本的其余操作（假设差异不大，后续有重试兜底）
+  return samples[0]?.filter(o => o.op !== 'declare') ?? [];
+}
+
 
 /** Direct pipeline: skip LLM, provide ops per sentence directly */
 export function runDirect(
