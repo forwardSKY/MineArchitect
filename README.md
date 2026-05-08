@@ -5,28 +5,67 @@
 ---
 ![architecture design](pictures/professional_architect.jpg)
 
-
 ## Quick Start
 
-```bash
-npm install && npx tsc && node dist/demo-100.js
-```
+### 1. Environment
 
-Edit three variables in `demo-live.ts`:
-
-```typescript
-const API_URL = 'https://your-endpoint/v1/chat/completions';
-const API_KEY = 'your-key';
-const MODEL = 'qwen-max';  // any OpenAI-compatible model
-```
+Requires Node.js v18+ (for native fetch support).
 
 ```bash
-npx tsc && node dist/demo-live.js
+node -v
 ```
 
-Compatible with: Qwen / GPT-4o / Claude / DeepSeek / local Ollama.
+### 2. Install Dependencies
+
+Initialize your project and install the required packages:
+
+```bash
+npm init -y
+npm install dotenv
+npm install --save-dev typescript ts-node @types/node
+```
+
+### 3. TypeScript Configuration
+
+Create a tsconfig.json in the root directory to ensure proper module resolution:
+
+```json
+{
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "target": "ES2020",
+    "strict": true,
+    "outDir": "./dist",
+    "rootDir": ".",
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["**/*.ts"]
+}
+```
+
+### 4. Environment Variables
+
+Create a .env file in the root directory and add your API key:
+
+```env
+DASHSCOPE_API_KEY=sk-your-actual-api-key
+```
 
 
+### 5. Run
+
+npx ts-node test_reproduce.ts
+
+```bash
+npx ts-node src/test_reproduce.ts
+```
+
+(Note: Replace test_reproduce.ts with your actual entry file if it differs).
+
+Once completed, the script will generate output_*.html files in your directory. Open them in your web browser to view the generated 3D scenes!
 ## Test Cases
 
 **Case 1 — Structural (suspension bridge, 5 entities):**

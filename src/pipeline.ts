@@ -1,27 +1,37 @@
 /**
- * pipeline.ts — End-to-End Orchestration
+ * pipeline.ts — End-to-End Orchestration (manifest-first)
  *
- * Input → Stage 1 (normalize) → Stage 2 (solve) → HTML
+ * Stage 1 (1 LLM call): raw text → JSON manifest with `entities` + `narrative`.
+ *                       All entities are pre-declared in the engine immediately.
+ * Stage 2 (N LLM calls): for each narrative sentence → constrain ops.
+ *                        With 1 retry on failure (fed feedback).
+ * Render (no LLM):       solved entities → HTML (three.js sketch).
  *
- * Stage 1: 1 LLM call, best model
- * Stage 2: N LLM calls (one per sentence), any model
- * Render:  0 LLM calls, pure template
+ * Why manifest-first?
+ *   The previous per-sentence-declare approach drifted on entity IDs
+ *   (tower_l vs left_tower vs tower_a) and required brittle vote-merging.
+ *   A single Stage 1 call locks the IDs, and Stage 2 only ever picks
+ *   from a fixed list — eliminating the entire voting/alignment problem.
  */
 
 import {
-  createEngine, execute, executeBatch, buildContext,
-  fillDefaults, solvedEntities, Op, Entity,
-  cloneEngine, commitInto, EngineState
-} from './engine';import { STAGE1_PROMPT, STAGE2_PROMPT } from './prompts';
+  createEngine, execute, executeBatch, fillDefaults, solvedEntities,
+  cloneEngine, commitInto, EngineState, Entity, Op,
+} from './engine';
+import { STAGE1_PROMPT, STAGE2_PROMPT, STAGE_FILL_PROMPT } from './prompts';
 
-type DeclareOp = Extract<Op, { op: 'declare' }>;
 export type LLMCall = (system: string, user: string) => Promise<string>;
 
-/** 每一句处理的上下文 */
-interface SentenceCtx {
-  allSentences: string[];
-  index: number;
-  recentWindow: number;
+interface EntityDecl {
+  id: string;
+  type: string;
+  dims: [number, number, number];
+  material?: string;
+}
+
+interface NarrativeItem {
+  refs: string[];
+  text: string;
 }
 
 export interface PipelineResult {
@@ -32,41 +42,450 @@ export interface PipelineResult {
   html: string;
 }
 
-/** Full pipeline: raw text → HTML */
-/** Full pipeline: raw text → HTML */
-/** Full pipeline: raw text → HTML */
-export async function run(
-  input: string,
-  callLLM: LLMCall,
-): Promise<PipelineResult> {
-  // ── Stage 1: Normalize ──
-  const normText = await callLLM(STAGE1_PROMPT, input);
-  const sentences = normText.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+// ─────────────────────────────────────────────────────────────
+//  Robust JSON extraction
+// ─────────────────────────────────────────────────────────────
 
-  // ── Stage 2: Solve ──
-  // THIS IS THE MISSING LINE YOUR EDITOR IS COMPLAINING ABOUT:
-  const engine = createEngine(); 
-  let totalOps = 0;
+function stripFences(s: string): string {
+  return s
+    .replace(/^\uFEFF/, '')
+    .replace(/^\s*```(?:json|JSON)?\s*\n?/i, '')
+    .replace(/\n?```\s*$/, '')
+    .trim();
+}
 
-  for (let i = 0; i < sentences.length; i++) {
-    const ctx: SentenceCtx = {
-      allSentences: sentences,
-      index: i,
-      recentWindow: 4   // 展示最近4句，可根据需要调整
-    };
-    const result = await solveSentenceWithVoting(engine, ctx, callLLM);
-    totalOps += result.logs.length;  
+/** Find first balanced `{...}` and parse. Tolerates trailing commas. */
+function extractJsonObject(raw: string): any | null {
+  const s = stripFences(raw);
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+
+  // Walk through, tracking string state and depth
+  let depth = 0;
+  let inStr: string | null = null;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inStr = ch; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        const candidate = s.substring(start, i + 1);
+        try { return JSON.parse(candidate); } catch {}
+        // Repair trailing commas
+        try { return JSON.parse(candidate.replace(/,(\s*[}\]])/g, '$1')); } catch {}
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Stage 1 parsing (manifest + narrative, with JSONL fallback)
+// ─────────────────────────────────────────────────────────────
+
+interface Stage1Output {
+  entities: EntityDecl[];
+  narrative: NarrativeItem[];
+}
+
+function sanitizeEntity(raw: any): EntityDecl | null {
+  if (!raw || typeof raw.id !== 'string') return null;
+  const id = raw.id.trim();
+  if (!id) return null;
+  const dims = raw.dims;
+  if (!Array.isArray(dims) || dims.length !== 3) return null;
+  const numDims = dims.map((v: any) => Number(v));
+  if (numDims.some(isNaN)) return null;
+  return {
+    id,
+    type: typeof raw.type === 'string' ? raw.type : 'box',
+    dims: [numDims[0], numDims[1], numDims[2]],
+    material: typeof raw.material === 'string' ? raw.material : undefined,
+  };
+}
+
+function parseStage1(raw: string): Stage1Output {
+  // Primary path: single object with entities + narrative
+  const obj = extractJsonObject(raw);
+  if (obj && Array.isArray(obj.entities) && Array.isArray(obj.narrative)) {
+    const entities: EntityDecl[] = [];
+    const seen = new Set<string>();
+    for (const e of obj.entities) {
+      const cleaned = sanitizeEntity(e);
+      if (cleaned && !seen.has(cleaned.id)) {
+        seen.add(cleaned.id);
+        entities.push(cleaned);
+      }
+    }
+    const narrative: NarrativeItem[] = [];
+    for (const n of obj.narrative) {
+      if (!n || typeof n.text !== 'string' || !n.text.trim()) continue;
+      narrative.push({
+        refs: Array.isArray(n.refs) ? n.refs.filter((x: any) => typeof x === 'string') : [],
+        text: n.text.trim(),
+      });
+    }
+    return { entities, narrative };
   }
 
-  // Fill any remaining DOF
+  // Legacy fallback: JSONL of {"entities":[...],"text":"..."}
+  const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+  const narrative: NarrativeItem[] = [];
+  for (const line of lines) {
+    if (!line.startsWith('{')) continue;
+    try {
+      const o = JSON.parse(line);
+      if (typeof o.text === 'string') {
+        narrative.push({
+          refs: Array.isArray(o.entities) ? o.entities : (Array.isArray(o.refs) ? o.refs : []),
+          text: o.text,
+        });
+      }
+    } catch { /* ignore */ }
+  }
+  if (narrative.length > 0) return { entities: [], narrative };
+
+  // Last resort: split raw text into sentences
+  const sentences = raw
+    .replace(/```[\s\S]*?```/g, ' ')
+    .split(/(?<=[.!?])\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 5);
+  return {
+    entities: [],
+    narrative: sentences.map(s => ({ refs: [], text: s })),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Stage 2 parsing
+// ─────────────────────────────────────────────────────────────
+
+function parseOps(raw: string): Op[] {
+  const obj = extractJsonObject(raw);
+  if (!obj) return [];
+  if (Array.isArray(obj)) return obj as Op[];
+  if (Array.isArray((obj as any).ops)) return (obj as any).ops as Op[];
+  if (typeof (obj as any).op === 'string') return [obj as Op];
+  return [];
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Context builder for Stage 2
+// ─────────────────────────────────────────────────────────────
+
+function shortEntity(e: Entity): string {
+  if (e.position) {
+    const [x, y, z] = e.position;
+    const [w, h, d] = e.dims;
+    return `${e.id}: ${e.type} dims=[${e.dims.join(',')}] RESOLVED at (${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)})` +
+      ` faces e=${(x + w / 2).toFixed(1)} w=${(x - w / 2).toFixed(1)}` +
+      ` n=${(z + d / 2).toFixed(1)} s=${(z - d / 2).toFixed(1)}` +
+      ` t=${(y + h / 2).toFixed(1)} b=${(y - h / 2).toFixed(1)}`;
+  }
+  return `${e.id}: ${e.type} dims=[${e.dims.join(',')}] DECLARED dof=${e.dofPos}/3`;
+}
+
+function buildPrompt(
+  engine: EngineState,
+  manifest: EntityDecl[],
+  narrative: NarrativeItem[],
+  index: number,
+  feedback: string
+): string {
+  const current = narrative[index];
+  const recent = narrative.slice(Math.max(0, index - 3), index);
+  const lookahead = narrative.slice(index + 1, index + 2);
+
+  // Entities relevant to this sentence: refs + recent refs + unresolved + sample of resolved
+  const inScope = new Set<string>();
+  current.refs.forEach(id => inScope.add(id));
+  recent.forEach(n => n.refs.forEach(id => inScope.add(id)));
+  for (const e of engine.entities.values()) {
+    if (e.dofPos > 0) inScope.add(e.id);
+  }
+
+  const lines: string[] = [];
+
+  // Manifest section: ALWAYS show the in-scope entities by ID
+  lines.push('== ENTITY MANIFEST (use these IDs and dims exactly) ==');
+  if (manifest.length > 0) {
+    for (const m of manifest) {
+      const e = engine.entities.get(m.id);
+      const status = e
+        ? (e.position
+            ? `RESOLVED at (${e.position.map(v => v.toFixed(2)).join(',')})`
+            : `DECLARED dof=${e.dofPos}/3`)
+        : 'NOT YET DECLARED';
+      const star = inScope.has(m.id) ? '★' : ' ';
+      lines.push(`  ${star} ${m.id}: ${m.type} dims=[${m.dims.join(',')}] material=${m.material ?? 'default'} | ${status}`);
+    }
+  } else {
+    // Fallback: show all engine entities (manifest empty when Stage 1 failed)
+    for (const e of engine.entities.values()) {
+      lines.push(`  ${shortEntity(e)}`);
+    }
+    if (engine.entities.size === 0) {
+      lines.push('  (no entities yet — declare new ones as needed)');
+    }
+  }
+
+  if (recent.length) {
+    lines.push('\n== RECENT SENTENCES (already processed) ==');
+    recent.forEach((n, i) =>
+      lines.push(`  [${index - recent.length + i + 1}] (${n.refs.join(',') || '-'}) ${n.text}`));
+  }
+
+  lines.push(`\n== CURRENT SENTENCE [${index + 1}/${narrative.length}] ==`);
+  lines.push(`primary refs: ${current.refs.join(', ') || '(none — infer from text)'}`);
+  lines.push(`text: ${current.text}`);
+
+  if (lookahead.length) {
+    lines.push(`\n(next sentence preview: ${lookahead[0].text})`);
+  }
+
+  if (feedback) {
+    lines.push(`\n== FEEDBACK FROM PREVIOUS ATTEMPT ==`);
+    lines.push(feedback);
+  }
+
+  lines.push('\nProduce {"ops":[...]} for the CURRENT SENTENCE only. JSON only.');
+  return lines.join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Solve a single sentence with one retry
+// ─────────────────────────────────────────────────────────────
+
+async function solveSentence(
+  engine: EngineState,
+  manifest: EntityDecl[],
+  narrative: NarrativeItem[],
+  index: number,
+  callLLM: LLMCall
+): Promise<{ ok: boolean; logs: string[] }> {
+  let feedback = '';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const prompt = buildPrompt(engine, manifest, narrative, index, feedback);
+
+    let resp = '';
+    try {
+      resp = await callLLM(STAGE2_PROMPT, prompt);
+    } catch (err: any) {
+      feedback = `LLM call failed: ${err?.message ?? err}`;
+      continue;
+    }
+
+    const ops = parseOps(resp);
+
+    // Empty ops is valid for transition sentences ("I walk forward")
+    if (ops.length === 0) {
+      return { ok: true, logs: ['no-op'] };
+    }
+
+    const trial = cloneEngine(engine);
+    const dofBefore = trial.totalDOF;
+    const logs = executeBatch(trial, ops);
+    const errors = logs.filter(l => l.startsWith('error'));
+    const dofReduced = dofBefore - trial.totalDOF;
+    const hasDeclare = ops.some(o => o.op === 'declare');
+
+    if (errors.length === 0 && (hasDeclare || dofReduced > 0)) {
+      commitInto(engine, trial);
+      return { ok: true, logs };
+    }
+
+    feedback =
+      `Attempt ${attempt} rejected.\n` +
+      (errors.length ? `Errors: ${errors.join('; ')}\n` : '') +
+      `DOF before=${dofBefore} after=${trial.totalDOF} (need decrease).\n` +
+      `Common fixes: use entity IDs from the manifest exactly, use at_x/at_z instead of plane,` +
+      ` ensure 3 independent constraints (one per axis).`;
+  }
+  return { ok: false, logs: ['gave up after 2 attempts'] };
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Common-sense closure round (Theory §5 fixed-point iteration)
+//
+//  After the main per-sentence loop, residual DOF is closed by
+//  feeding unresolved entities back to the LLM for common-sense
+//  placement, BEFORE falling back to blind defaults.
+//
+//  Convergence:
+//    DOF ∈ ℤ≥0, monotone non-increasing → terminates ≤ 4N rounds.
+//    In practice 1–2 rounds suffice.
+// ─────────────────────────────────────────────────────────────
+
+interface FillResult { rounds: number; resolvedDOF: number; }
+
+function buildFillPrompt(engine: EngineState): string {
+  const lines: string[] = [];
+  const resolved: Entity[] = [];
+  const unresolved: Entity[] = [];
+  for (const e of engine.entities.values()) {
+    (e.dofPos > 0 ? unresolved : resolved).push(e);
+  }
+
+  // Show resolved entities so LLM can reason relative to them.
+  // For very large scenes, cap to avoid prompt bloat.
+  const RESOLVED_LIMIT = 60;
+  lines.push('== RESOLVED ENTITIES (use as anchors) ==');
+  const shown = resolved.slice(0, RESOLVED_LIMIT);
+  for (const e of shown) {
+    const [x, y, z] = e.position!;
+    lines.push(`  ${e.id}: ${e.type} at (${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}) dims=[${e.dims.join(',')}]`);
+  }
+  if (resolved.length > RESOLVED_LIMIT) {
+    lines.push(`  … and ${resolved.length - RESOLVED_LIMIT} more resolved entities (omitted for brevity).`);
+  }
+
+  lines.push('\n== UNRESOLVED ENTITIES (place these now) ==');
+  for (const e of unresolved) {
+    lines.push(`  ${e.id}: ${e.type} dims=[${e.dims.join(',')}] dof_remaining=${e.dofPos}/3 planes_so_far=${e.planes.length}`);
+  }
+
+  lines.push('\nProduce constrain ops to bring every unresolved entity to dof=0.');
+  lines.push('Use entity IDs exactly as listed. JSON only.');
+  return lines.join('\n');
+}
+
+async function commonSenseFillRound(
+  engine: EngineState,
+  callLLM: LLMCall,
+  maxRounds = 2
+): Promise<FillResult> {
+  let totalResolved = 0;
+  let round = 0;
+
+  for (round = 1; round <= maxRounds; round++) {
+    const unresolvedCount = [...engine.entities.values()].filter(e => e.dofPos > 0).length;
+    if (unresolvedCount === 0) break;
+
+    const prompt = buildFillPrompt(engine);
+
+    let resp = '';
+    try {
+      resp = await callLLM(STAGE_FILL_PROMPT, prompt);
+    } catch (err: any) {
+      console.warn(`  fill round ${round} LLM error: ${err?.message ?? err}`);
+      break;
+    }
+
+    const ops = parseOps(resp);
+    if (ops.length === 0) break;
+
+    const trial = cloneEngine(engine);
+    const before = trial.totalDOF;
+    executeBatch(trial, ops);
+    const reduction = before - trial.totalDOF;
+
+    if (reduction > 0) {
+      commitInto(engine, trial);
+      totalResolved += reduction;
+    } else {
+      // No progress — abort to avoid infinite loops on pathological responses
+      break;
+    }
+  }
+  return { rounds: round - 1, resolvedDOF: totalResolved };
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Information budget (Theory §1.2)
+// ─────────────────────────────────────────────────────────────
+
+function reportBudget(engine: EngineState, narrativeLen: number): void {
+  let totalDeclared = 0;
+  let posResolved = 0;
+  let posUnresolved = 0;
+  for (const e of engine.entities.values()) {
+    totalDeclared++;
+    if (e.position) posResolved++;
+    else posUnresolved += e.dofPos;
+  }
+  const posDOFNeeded = totalDeclared * 3;
+  const posDOFProvided = posDOFNeeded - posUnresolved;
+  console.log(
+    `  Info budget: positional DOF ${posDOFProvided}/${posDOFNeeded} ` +
+    `(${posResolved}/${totalDeclared} entities resolved) ` +
+    `from ${narrativeLen} sentences`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Pre-declare manifest entities into engine
+// ─────────────────────────────────────────────────────────────
+
+function preDeclareManifest(engine: EngineState, manifest: EntityDecl[]): number {
+  let count = 0;
+  for (const m of manifest) {
+    const result = execute(engine, {
+      op: 'declare',
+      id: m.id,
+      type: m.type,
+      dims: m.dims,
+      material: m.material,
+    });
+    if (result.startsWith('ok')) count++;
+  }
+  return count;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Main pipeline
+// ─────────────────────────────────────────────────────────────
+
+export async function run(
+  input: string,
+  callLLM: LLMCall
+): Promise<PipelineResult> {
+  // Stage 1
+  const stage1Resp = await callLLM(STAGE1_PROMPT, input);
+  const { entities: manifest, narrative } = parseStage1(stage1Resp);
+
+  console.log(`  Stage 1: ${manifest.length} entities declared, ${narrative.length} sentences`);
+
+  // Engine setup — pre-declare everything from the manifest
+  const engine = createEngine();
+  preDeclareManifest(engine, manifest);
+
+  // Stage 2 — one call per narrative sentence (with retry)
+  let totalOps = 0;
+  let okCount = 0;
+  for (let i = 0; i < narrative.length; i++) {
+    const result = await solveSentence(engine, manifest, narrative, i, callLLM);
+    totalOps += result.logs.length;
+    if (result.ok) okCount++;
+  }
+  console.log(`  Stage 2: ${okCount}/${narrative.length} sentences solved`);
+  reportBudget(engine, narrative.length);
+
+  // Common-sense closure rounds (Theory §5 fixed-point iteration)
+  const fill = await commonSenseFillRound(engine, callLLM);
+  if (fill.rounds > 0) {
+    console.log(`  Common-sense fill: ${fill.resolvedDOF} DOF resolved across ${fill.rounds} round(s)`);
+    reportBudget(engine, narrative.length);
+  }
+
+  // Last resort: blind defaults for anything still unresolved
   fillDefaults(engine);
 
-  // ── Render ──
+  // Render
   const entities = solvedEntities(engine);
   const html = renderHTML(entities);
 
   return {
-    normalized: sentences,
+    normalized: narrative.map(n => n.text),
     entityCount: entities.length,
     totalOps,
     finalDOF: engine.totalDOF,
@@ -74,350 +493,8 @@ export async function run(
   };
 }
 
-
-/** Parse JSON ops from LLM response */
-function parseOps(raw: string): Op[] {
-  try {
-    const clean = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-    // Find the JSON object
-    const start = clean.indexOf('{');
-    const end = clean.lastIndexOf('}');
-    if (start < 0 || end < 0) return [];
-    const json = JSON.parse(clean.substring(start, end + 1));
-    return json.ops || [];
-  } catch {
-    return [];
-  }
-}
-
-
-/** 只向 LLM 展示与当前句子相关的实体（滑动窗口） */
-function buildScopedContext(
-  engine: EngineState,
-  ctx: SentenceCtx,
-  feedback: string
-): string {
-  const current = ctx.allSentences[ctx.index];
-  const recent = ctx.allSentences.slice(
-    Math.max(0, ctx.index - ctx.recentWindow),
-    ctx.index
-  );
-  const lookahead = ctx.allSentences.slice(ctx.index + 1, ctx.index + 2);
-
-  // 1) 确定作用域内实体：
-  //    - 当前句和前几句文本中出现过的 ID
-  //    - 未完成（dofPos > 0）的实体
-  //    - 最后声明的几个实体（最近 5 个）
-  const inScope = new Set<string>();
-  const text = [...recent, current].join(' ').toLowerCase();
-
-  // 遍历所有实体，ID 出现在文本中则加入范围
-  for (const id of engine.entities.keys()) {
-    if (text.includes(id)) inScope.add(id);
-    else {
-      // 宽松匹配：snake_case 分词，至少出现 2 个字符的片段
-      const parts = id.split('_');
-      if (parts.length && parts.every(p => text.includes(p))) inScope.add(id);
-    }
-  }
-
-  // 未完成实体总是可见
-  for (const e of engine.entities.values()) {
-    if (e.dofPos > 0) inScope.add(e.id);
-  }
-
-  // 最后声明的 5 个实体（按 id 插入顺序不好，我们记一下最后 declare 的时间？暂时用最近加入的 5 个）
-  // 简单方案：把 entities 转为数组取最后 5 个
-  const allIds = [...engine.entities.keys()];
-  const recentDeclarations = allIds.slice(-5);
-  recentDeclarations.forEach(id => inScope.add(id));
-
-  // 2) 构建上下文文本
-  const lines: string[] = ['== ENTITIES IN SCOPE =='];
-  for (const id of inScope) {
-    const e = engine.entities.get(id)!;
-    lines.push(formatEntityShort(e));
-  }
-
-  const outIds = allIds.filter(id => !inScope.has(id));
-  if (outIds.length > 0) {
-    lines.push(`\n== ${outIds.length} OTHER ENTITIES (IDs only) ==`);
-    lines.push(outIds.join(', '));
-  }
-
-  // 3) 叙事句
-  lines.push('\n== RECENT SENTENCES ==');
-  recent.forEach((s, i) => lines.push(`[${ctx.index - recent.length + i + 1}] ${s}`));
-  lines.push(`\n>>> CURRENT [${ctx.index + 1}/${ctx.allSentences.length}] <<<`);
-  lines.push(current);
-  if (lookahead.length) lines.push(`\n(next: ${lookahead[0]})`);
-
-  if (feedback) lines.push(`\n== FEEDBACK FROM PREVIOUS ATTEMPT ==\n${feedback}`);
-
-  return lines.join('\n');
-}
-
-/** 简短格式化单个实体 */
-function formatEntityShort(e: Entity): string {
-  const status = e.position
-    ? `pos=(${e.position.map(v => v.toFixed(1))})`
-    : `dof=${e.dofPos}`;
-  let line = `${e.id}: ${e.type} dims(${e.dims}) ${status}`;
-  if (e.position) {
-    const [x, y, z] = e.position;
-    const [w, h, d] = e.dims;
-    line += ` faces: e${(x + w/2).toFixed(1)} w${(x - w/2).toFixed(1)} n${(z + d/2).toFixed(1)} s${(z - d/2).toFixed(1)} t${(y + h/2).toFixed(1)} b${(y - h/2).toFixed(1)}`;
-  }
-  return line;
-}
-
-
-/** 处理单个句子的 Agent Loop，带重试和反馈 */
-async function solveSentence(
-  engine: EngineState,
-  ctx: SentenceCtx,
-  callLLM: LLMCall,
-  maxAttempts = 3
-): Promise<{ ok: boolean; attempts: number; logs: string[] }> {
-  let feedback = '';
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // 1. 克隆引擎，在副本上尝试
-    const trial = cloneEngine(engine);
-    const dofBefore = trial.totalDOF;
-
-    // 2. 构建 prompt（目前使用全量上下文）
-    const current = ctx.allSentences[ctx.index];
-    const recent = ctx.allSentences.slice(
-      Math.max(0, ctx.index - ctx.recentWindow),
-      ctx.index
-    );
-    const prompt = buildScopedContext(trial, ctx, feedback) +
-      `\nOutput the PGA operations for this sentence as JSON {"ops":[...]}`;
-
-    // 3. 调用 LLM
-    const resp = await callLLM(STAGE2_PROMPT, prompt);
-    const ops = parseOps(resp);
-
-    // 4. 空操作直接成功
-    if (ops.length === 0) {
-      return { ok: true, attempts: attempt, logs: ['no-op'] };
-    }
-
-    // 5. 在副本上执行操作
-    const logs = executeBatch(trial, ops);
-
-    // 6. 检查结果
-    const errors = logs.filter(l => l.startsWith('error'));
-    const dofReduced = dofBefore - trial.totalDOF;
-    const hasDeclare = ops.some(o => o.op === 'declare');
-
-    // 接受条件：无错误，且 (有 declare 或 DOF 确实下降)
-    const ok = errors.length === 0 && (hasDeclare || dofReduced > 0);
-
-    if (ok) {
-      // 在提交之前，运行几何不变量
-      const violations = checkInvariants(trial, ops);
-      if (violations.length > 0) {
-        feedback = `Geometry violations:\n${violations.join('\n')}\nPlease adjust constraints.`;
-        continue; // 重新尝试
-      }
-      // 成功：将副本状态写回主引擎
-      commitInto(engine, trial);
-      return { ok: true, attempts: attempt, logs };
-    }
-
-    // 失败：构建反馈并准备重试
-    feedback =
-      `Attempt ${attempt} rejected.\n` +
-      (errors.length ? `Errors: ${errors.join('; ')}\n` : '') +
-      `DOF before=${dofBefore} after=${trial.totalDOF} (need to decrease).\n` +
-      `Common issues: parallel/duplicate planes, wrong face name, referencing undeclared id.`;
-  }
-
-  // 超过最大重试次数
-  return { ok: false, attempts: maxAttempts, logs: ['gave up after retries'] };
-}
-
-
-/** 轻量几何合理性检查，返回错误消息数组 */
-function checkInvariants(engine: EngineState, recentOps: Op[]): string[] {
-  const violations: string[] = [];
-  // 检查所有最近被操作过的实体
-  const touched = new Set(recentOps.map(o => 'entity' in o ? o.entity : o.id).filter(Boolean));
-  for (const id of touched) {
-    const e = engine.entities.get(id as string);
-    if (!e || !e.position) continue;
-    const [x, y, z] = e.position;
-    // 1. 禁止陷入地下
-    if (y < -0.01) {
-      violations.push(`${id}: y=${y.toFixed(2)} is below ground`);
-    }
-    // 2. 对于 against/centered_in 等约束，检查是否脱离父实体太远？
-    // 简单检查：如果实体期望在某个房间内，应基本在房间 AABB 内（省略，可后续加）
-  }
-  return violations;
-}
-
-// 多数决
-function mode<T>(arr: T[]): T {
-  const counts = new Map<string, number>();
-  arr.forEach(item => {
-    const key = JSON.stringify(item);
-    counts.set(key, (counts.get(key) || 0) + 1);
-  });
-  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  return JSON.parse(sorted[0][0]);
-}
-
-// 中位数（防离群）
-function median(arr: number[]): number {
-  const sorted = [...arr].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted[mid];
-}
-
-// 从多个样本中投票出 declare 操作列表
-function voteDeclares(samples: Op[][], minVotes: number): Op[] {
-  const declares: Op[] = [];
-  const byId = new Map<string, DeclareOp[]>();
-  for (const ops of samples) {
-    for (const o of ops) {
-      if (o.op !== 'declare') continue;
-      if (!byId.has(o.id)) byId.set(o.id, []);
-      byId.get(o.id)!.push(o as DeclareOp);   // 类型窄化
-    }
-  }
-  for (const [id, list] of byId) {
-    if (list.length < minVotes) continue;
-    const types = list.map(d => d.type);
-    const typeMode = mode(types);
-    const dims0 = median(list.map(d => d.dims[0]));
-    const dims1 = median(list.map(d => d.dims[1]));
-    const dims2 = median(list.map(d => d.dims[2]));
-    const materials = list.map(d => d.material ?? 'default');
-    const matMode = mode(materials);
-    declares.push({
-      op: 'declare', id,
-      type: typeMode,
-      dims: [dims0, dims1, dims2],
-      material: matMode,
-    });
-  }
-  return declares;
-}
-
-async function solveSentenceWithVoting(
-  engine: EngineState,
-  ctx: SentenceCtx,
-  callLLM: LLMCall,
-  k = 3,
-  maxAttempts = 2
-): Promise<{ ok: boolean; attempts: number; logs: string[] }> {
-  // 1. 探针调用，判断是否含 declare
-  const probePrompt = buildScopedContext(engine, ctx, '') + '\nOutput JSON.';
-  const probeResp = await callLLM(STAGE2_PROMPT, probePrompt);
-  const probeOps = parseOps(probeResp);
-  const hasDeclare = probeOps.some(o => o.op === 'declare');
-
-  if (!hasDeclare) {
-    // 无 declare，走标准 Agent Loop（但要包含 probeOps 作为第一次尝试）
-    const trial = cloneEngine(engine);
-    const dofBefore = trial.totalDOF;
-    const logs = executeBatch(trial, probeOps);
-    const errors = logs.filter(l => l.startsWith('error'));
-    const dofReduced = dofBefore - trial.totalDOF;
-    if (errors.length === 0 && (probeOps.length === 0 || dofReduced > 0)) {
-      commitInto(engine, trial);
-      return { ok: true, attempts: 1, logs };
-    }
-    // 否则走普通重试循环（这里可以复用 solveSentence，但简单起见我们直接循环）
-    return solveSentence(engine, ctx, callLLM, maxAttempts);
-  }
-
-  // 2. 有 declare，再采集 k-1 次
-  const extraResponses = await Promise.all(
-    Array.from({ length: k - 1 }, () =>
-      callLLM(STAGE2_PROMPT, buildScopedContext(engine, ctx, '') + '\nOutput JSON.')
-    )
-  );
-  const samples = [probeOps, ...extraResponses.map(parseOps)];
-
-  // 3. 投票得出 declare 操作
-  const declaredOps = voteDeclares(samples, Math.ceil(k / 2));
-  // 如果投票失败，可以回退到只有 probeOps 或使用默认尺寸，这里简单处理：若投票为空，则直接用 probeOps
-  const restOps = pickAlignedRest(samples, declaredOps);
-  const finalOps = declaredOps.length > 0 ? [...declaredOps, ...restOps] : probeOps;
-
-  // 4. 执行最终 ops，带一次重试（类似 solveSentence 的逻辑）
-  let feedback = '';
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const trial = cloneEngine(engine);
-    const dofBefore = trial.totalDOF;
-    const logs = executeBatch(trial, finalOps);
-    const errors = logs.filter(l => l.startsWith('error'));
-    const dofReduced = dofBefore - trial.totalDOF;
-    const ok = errors.length === 0 && (finalOps.length === 0 || dofReduced > 0);
-    if (ok) {
-      // 几何检查（复用）
-      const violations = checkInvariants(trial, finalOps);
-      if (violations.length === 0) {
-        commitInto(engine, trial);
-        return { ok: true, attempts: attempt, logs };
-      }
-      feedback = `Geometry violations:\n${violations.join('\n')}\nPlease fix.`;
-    } else {
-      feedback = `Attempt ${attempt} failed.\nErrors: ${errors.join('; ')}`;
-    }
-    // 重试时重新生成 ops（这里暂用 finalOps 不变，简单起见；也可重新调用 LLM）
-    // 为了精简，可以在重试时再调用一次 LLM 获得新的 ops
-    if (attempt < maxAttempts) {
-      const retryResp = await callLLM(STAGE2_PROMPT, buildScopedContext(engine, ctx, feedback) + '\nOutput JSON.');
-      finalOps.splice(0, finalOps.length, ...parseOps(retryResp));
-    }
-  }
-  return { ok: false, attempts: maxAttempts, logs: [] };
-}
-
-// 选择一个样本的非 declare 操作，选择标准：其 declare 与投票得出的 declare 最相似
-function pickAlignedRest(samples: Op[][], votedDeclares: Op[]): Op[] {
-  // 简单实现：取第一个样本的其余操作（假设差异不大，后续有重试兜底）
-  return samples[0]?.filter(o => o.op !== 'declare') ?? [];
-}
-
-
-/** Direct pipeline: skip LLM, provide ops per sentence directly */
-export function runDirect(
-  sentences: string[],
-  opsPerSentence: Op[][],
-): PipelineResult {
-  const engine = createEngine();
-  let totalOps = 0;
-
-  for (let i = 0; i < sentences.length; i++) {
-    const ops = opsPerSentence[i] || [];
-    const logs = executeBatch(engine, ops);
-    totalOps += ops.length;
-    // Print progress
-    if (ops.length > 0) {
-      console.log(`  [${i + 1}/${sentences.length}] "${sentences[i].substring(0, 50)}..."`);
-      logs.forEach(l => console.log(`    ${l}`));
-    }
-  }
-
-  console.log(`\n  Pre-default DOF: ${engine.totalDOF}`);
-  fillDefaults(engine);
-  console.log(`  Post-default DOF: ${engine.totalDOF}`);
-
-  const entities = solvedEntities(engine);
-  const html = renderHTML(entities);
-
-  return { normalized: sentences, entityCount: entities.length, totalOps, finalDOF: engine.totalDOF, html };
-}
-
-
 // ═══════════════════════════════════════════════════════════════════
-// HTML RENDERER — Architectural sketch aesthetic
+// HTML RENDERER — Architectural sketch aesthetic (unchanged)
 // ═══════════════════════════════════════════════════════════════════
 
 interface RenderEntity {
@@ -428,7 +505,6 @@ interface RenderEntity {
 }
 
 const MAT_COLORS: Record<string, [string, string, number]> = {
-  // [fill, edge, opacity]
   wood:     ['#C8A060', '#8A6830', 0.50],
   oak:      ['#D4B878', '#9A7840', 0.50],
   stone:    ['#908478', '#605448', 0.55],
@@ -445,20 +521,17 @@ const MAT_COLORS: Record<string, [string, string, number]> = {
 };
 
 function renderHTML(entities: RenderEntity[]): string {
-  // Build mesh data
   const meshes = entities.map(e => {
     const [fill, edge, opacity] = MAT_COLORS[e.material] || MAT_COLORS.default;
     return { ...e, fill, edge, opacity };
   });
 
-  // Compute camera bounds
   let maxR = 10;
   for (const m of meshes) {
     const r = Math.sqrt(m.position[0] ** 2 + m.position[2] ** 2) + Math.max(...m.dims);
     if (r > maxR) maxR = r;
   }
-  const camDist = maxR * 1.8;
-
+  const camDist = Math.min(maxR * 1.8, 200);
   const meshJSON = JSON.stringify(meshes);
 
   return `<!DOCTYPE html>
@@ -498,19 +571,19 @@ renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
 renderer.setClearColor(0xf5f2ed);renderer.localClippingEnabled=true;
 document.body.appendChild(renderer.domElement);
 const scene=new THREE.Scene();
-scene.fog=new THREE.Fog(0xf5f2ed,50,90);
-const cam=new THREE.PerspectiveCamera(28,W/H,.1,200);
+scene.fog=new THREE.Fog(0xf5f2ed,80,160);
+const cam=new THREE.PerspectiveCamera(28,W/H,.1,400);
 scene.add(new THREE.AmbientLight(0xffffff,.45));
 const sun=new THREE.DirectionalLight(0xFFF8EE,.55);
 sun.position.set(12,25,15);sun.castShadow=true;
-sun.shadow.camera.left=-20;sun.shadow.camera.right=20;
-sun.shadow.camera.top=20;sun.shadow.camera.bottom=-20;
+sun.shadow.camera.left=-30;sun.shadow.camera.right=30;
+sun.shadow.camera.top=30;sun.shadow.camera.bottom=-30;
 sun.shadow.mapSize.set(2048,2048);scene.add(sun);
 scene.add(new THREE.HemisphereLight(0xD4E4F4,0xE8DCC8,.25));
-const gnd=new THREE.Mesh(new THREE.PlaneGeometry(80,80),new THREE.MeshLambertMaterial({color:0xE8E4DC}));
+const gnd=new THREE.Mesh(new THREE.PlaneGeometry(200,200),new THREE.MeshLambertMaterial({color:0xE8E4DC}));
 gnd.rotation.x=-Math.PI/2;gnd.position.y=-.01;gnd.receiveShadow=true;scene.add(gnd);
-scene.add(new THREE.GridHelper(40,40,0xd8d4cc,0xe0dcd4));
-const clip=new THREE.Plane(new THREE.Vector3(0,-1,0),20);
+scene.add(new THREE.GridHelper(80,80,0xd8d4cc,0xe0dcd4));
+const clip=new THREE.Plane(new THREE.Vector3(0,-1,0),50);
 const fills=[],edges=[];
 M.forEach(m=>{
   const g=new THREE.BoxGeometry(m.dims[0],m.dims[1],m.dims[2]);
@@ -541,7 +614,7 @@ let dr=false,px=0,py=0;
 renderer.domElement.addEventListener('pointerdown',e=>{dr=true;px=e.clientX;py=e.clientY;renderer.domElement.setPointerCapture(e.pointerId)});
 renderer.domElement.addEventListener('pointermove',e=>{if(!dr)return;theta-=(e.clientX-px)*.006;phi=Math.max(.02,Math.min(1.4,phi+(e.clientY-py)*.006));px=e.clientX;py=e.clientY;uc()});
 renderer.domElement.addEventListener('pointerup',()=>dr=false);
-renderer.domElement.addEventListener('wheel',e=>{radius=Math.max(5,Math.min(70,radius+e.deltaY*.04));uc();e.preventDefault()},{passive:false});
+renderer.domElement.addEventListener('wheel',e=>{radius=Math.max(5,Math.min(200,radius+e.deltaY*.06));uc();e.preventDefault()},{passive:false});
 window.addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
 window.setMode=function(mode){
   document.querySelectorAll('.btn').forEach(b=>b.classList.remove('on'));
@@ -549,7 +622,7 @@ window.setMode=function(mode){
   fills.forEach(m=>{m.visible=mode!=='wire';if(mode==='xray')m.material.opacity=.08;else m.material.opacity=parseFloat(m.material.userData?.origOp||m.material.opacity);});
   edges.forEach(w=>{w.material.opacity=mode==='wire'?.8:.65;w.visible=true});
 };
-window.setCut=function(v){clip.constant=v*.12};
+window.setCut=function(v){clip.constant=v*.5};
 (function loop(){requestAnimationFrame(loop);renderer.render(scene,cam)})();
 </script></body></html>`;
 }

@@ -9,6 +9,8 @@
  * directly via Cramer's rule on the 3×3 coefficient matrix,
  * which is algebraically equivalent to the triple meet
  * P = π₁ ∧ π₂ ∧ π₃  but numerically more robust.
+ *
+ * (No changes from previous version — this file is already correct.)
  */
 
 /** Plane: [nx, ny, nz, d] where nx·x + ny·y + nz·z + d = 0 */
@@ -25,7 +27,7 @@ export function meetPlanes(p1: Plane, p2: Plane, p3: Plane): [number, number, nu
     b1 * (a2 * c3 - a3 * c2) +
     c1 * (a2 * b3 - a3 * b2);
 
-  if (Math.abs(det) < 1e-10) return null; // planes don't meet at a point
+  if (Math.abs(det) < 1e-10) return null;
 
   const x = (
     -d1 * (b2 * c3 - b3 * c2) +

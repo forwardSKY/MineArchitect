@@ -1,25 +1,29 @@
 {
-  "name": "minearchitect",
+  "name": "great",
   "version": "1.0.0",
   "description": "**Text → 3D Architectural Sketch via Projective Geometric Algebra**",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/forwardSKY/MineArchitect.git"
-  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/forwardSKY/MineArchitect.git"
+  },
   "bugs": {
     "url": "https://github.com/forwardSKY/MineArchitect/issues"
   },
-  "homepage": "https://github.com/forwardSKY/MineArchitect#readme",
-  "devDependencies": {
-    "@types/node": "^25.6.1",
-    "typescript": "^6.0.3"
-  }
+  "homepage": "https://github.com/forwardSKY/MineArchitect#readme"
 }
