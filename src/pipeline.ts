@@ -89,6 +89,88 @@ function parseOps(raw: string): Op[] {
   }
 }
 
+
+/** 只向 LLM 展示与当前句子相关的实体（滑动窗口） */
+function buildScopedContext(
+  engine: EngineState,
+  ctx: SentenceCtx,
+  feedback: string
+): string {
+  const current = ctx.allSentences[ctx.index];
+  const recent = ctx.allSentences.slice(
+    Math.max(0, ctx.index - ctx.recentWindow),
+    ctx.index
+  );
+  const lookahead = ctx.allSentences.slice(ctx.index + 1, ctx.index + 2);
+
+  // 1) 确定作用域内实体：
+  //    - 当前句和前几句文本中出现过的 ID
+  //    - 未完成（dofPos > 0）的实体
+  //    - 最后声明的几个实体（最近 5 个）
+  const inScope = new Set<string>();
+  const text = [...recent, current].join(' ').toLowerCase();
+
+  // 遍历所有实体，ID 出现在文本中则加入范围
+  for (const id of engine.entities.keys()) {
+    if (text.includes(id)) inScope.add(id);
+    else {
+      // 宽松匹配：snake_case 分词，至少出现 2 个字符的片段
+      const parts = id.split('_');
+      if (parts.length && parts.every(p => text.includes(p))) inScope.add(id);
+    }
+  }
+
+  // 未完成实体总是可见
+  for (const e of engine.entities.values()) {
+    if (e.dofPos > 0) inScope.add(e.id);
+  }
+
+  // 最后声明的 5 个实体（按 id 插入顺序不好，我们记一下最后 declare 的时间？暂时用最近加入的 5 个）
+  // 简单方案：把 entities 转为数组取最后 5 个
+  const allIds = [...engine.entities.keys()];
+  const recentDeclarations = allIds.slice(-5);
+  recentDeclarations.forEach(id => inScope.add(id));
+
+  // 2) 构建上下文文本
+  const lines: string[] = ['== ENTITIES IN SCOPE =='];
+  for (const id of inScope) {
+    const e = engine.entities.get(id)!;
+    lines.push(formatEntityShort(e));
+  }
+
+  const outIds = allIds.filter(id => !inScope.has(id));
+  if (outIds.length > 0) {
+    lines.push(`\n== ${outIds.length} OTHER ENTITIES (IDs only) ==`);
+    lines.push(outIds.join(', '));
+  }
+
+  // 3) 叙事句
+  lines.push('\n== RECENT SENTENCES ==');
+  recent.forEach((s, i) => lines.push(`[${ctx.index - recent.length + i + 1}] ${s}`));
+  lines.push(`\n>>> CURRENT [${ctx.index + 1}/${ctx.allSentences.length}] <<<`);
+  lines.push(current);
+  if (lookahead.length) lines.push(`\n(next: ${lookahead[0]})`);
+
+  if (feedback) lines.push(`\n== FEEDBACK FROM PREVIOUS ATTEMPT ==\n${feedback}`);
+
+  return lines.join('\n');
+}
+
+/** 简短格式化单个实体 */
+function formatEntityShort(e: Entity): string {
+  const status = e.position
+    ? `pos=(${e.position.map(v => v.toFixed(1))})`
+    : `dof=${e.dofPos}`;
+  let line = `${e.id}: ${e.type} dims(${e.dims}) ${status}`;
+  if (e.position) {
+    const [x, y, z] = e.position;
+    const [w, h, d] = e.dims;
+    line += ` faces: e${(x + w/2).toFixed(1)} w${(x - w/2).toFixed(1)} n${(z + d/2).toFixed(1)} s${(z - d/2).toFixed(1)} t${(y + h/2).toFixed(1)} b${(y - h/2).toFixed(1)}`;
+  }
+  return line;
+}
+
+
 /** 处理单个句子的 Agent Loop，带重试和反馈 */
 async function solveSentence(
   engine: EngineState,
@@ -109,12 +191,8 @@ async function solveSentence(
       Math.max(0, ctx.index - ctx.recentWindow),
       ctx.index
     );
-    let prompt = buildContext(trial);
-    prompt += `\n\n== RECENT SENTENCES ==\n`;
-    recent.forEach((s, i) => prompt += `[${ctx.index - recent.length + i + 1}] ${s}\n`);
-    prompt += `\n== CURRENT SENTENCE (${ctx.index + 1}/${ctx.allSentences.length}) ==\n${current}\n`;
-    if (feedback) prompt += `\n== FEEDBACK FROM PREVIOUS ATTEMPT ==\n${feedback}\n`;
-    prompt += `\nOutput the PGA operations for this sentence as JSON {"ops":[...]}`;
+    const prompt = buildScopedContext(trial, ctx, feedback) +
+      `\nOutput the PGA operations for this sentence as JSON {"ops":[...]}`;
 
     // 3. 调用 LLM
     const resp = await callLLM(STAGE2_PROMPT, prompt);
